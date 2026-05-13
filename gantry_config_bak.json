@@ -1,0 +1,11 @@
+{
+  "pulley_teeth": 80,
+  "microstep": 8,
+  "manual_rpm": 40.0,
+  "scan_rpm": 30.0,
+  "scan_sample_steps": 10,
+  "bulk_size": 10,
+  "startup_ignore_steps": 1600,
+  "use_oor": true,
+  "oor_x_mm": 4.0
+}
