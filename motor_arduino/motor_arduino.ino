@@ -1,12 +1,15 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// Gantry Motor Controller v5 — Arduino R4 (wired USB-Serial)
+// Gantry Motor Controller — Arduino R4 (wired USB-Serial)
 //
-// Changes from v4:
-//   - ST now includes sequence number:  ST:<seq>,<steps>
-//   - SCAN_SAMPLE_STEPS is a variable (changeable via serial command)
-//   - Right-limit CB spam bug fixed: limitB_hit only clears when
-//     gantry has actually moved away (pin LOW for DEBOUNCE_COUNT loops)
-//   - ENA active LOW (matches v4)
+// KEY FIX: Removed all Arduino String heap allocation from hot-path functions.
+// sendStepTelemetry() is called every scanSampleSteps steps throughout the
+// entire scan.  Each String("ST:" + String(n) + ...) does a heap malloc/free.
+// After hundreds of calls the heap fragments — allocations stall for tens of
+// milliseconds, loop() stops running fast, checkLimits() gets skipped, and
+// the right-limit trigger is missed or SD: is never sent.
+//
+// Solution: replace EVERY String concatenation with chained Serial.print()
+// calls.  No heap allocation, no fragmentation, deterministic timing.
 //
 // Wiring:
 //   STEP → pin 6    DIR → pin 4    ENA → pin 5 (LOW = enabled)
@@ -44,16 +47,11 @@
 #define STEP_DELTA           10
 
 // ── Scan sampling ─────────────────────────────────────────────────────────────
-// Resolution (mm) = SCAN_SAMPLE_STEPS / steps_per_mm
-// steps_per_mm = (FULL_STEPS × MICROSTEP) / (PULLEY_TEETH × PITCH_MM)
-// Default 10 → 1mm resolution at 80T pulley, 8x microstep
 #define SCAN_SAMPLE_STEPS_DEFAULT  10
 #define SCAN_SAMPLE_STEPS_MIN       1
 #define SCAN_SAMPLE_STEPS_MAX     200
 
 // ── Limit switch debounce ─────────────────────────────────────────────────────
-// Pin must read consistently for this many loop() calls before state changes.
-// Prevents the right-limit CB spam caused by mechanical bounce after scan ends.
 #define DEBOUNCE_COUNT  5
 
 // ── Pins ──────────────────────────────────────────────────────────────────────
@@ -63,7 +61,6 @@
 #define PIN_SW_A  9
 #define PIN_SW_B  11
 
-// ── Limit switch ─────────────────────────────────────────────────────────────
 // NC + INPUT_PULLUP:
 //   Pin HIGH = switch open  = TRIGGERED (gantry pressed switch open)
 //   Pin LOW  = switch closed = not triggered
@@ -79,18 +76,17 @@ int   stepDelay = STEP_DELAY_DEFAULT;
 int   scanDelay = STEP_DELAY_SCAN;
 int   scanSampleSteps = SCAN_SAMPLE_STEPS_DEFAULT;
 
-// Scan state
-long  scanSteps  = 0;   // raw step counter
-long  sampleCtr  = 0;   // steps since last sample
-long  seqNum     = 0;   // sequence number sent to PC
+long  scanSteps  = 0;
+long  sampleCtr  = 0;
+long  seqNum     = 0;
 
-// Limit state with debounce counters
 bool  limitA_hit     = false;
 bool  limitB_hit     = false;
-int   debounceA_low  = 0;   // consecutive LOW readings for SW_A
-int   debounceB_low  = 0;   // consecutive LOW readings for SW_B
+int   debounceA_low  = 0;
+int   debounceB_low  = 0;
 
-// RX buffer
+// ── RX buffer ────────────────────────────────────────────────────────────────
+// Using a plain char array throughout — no String objects in command parsing.
 #define RX_BUF_SIZE 32
 char    rxBuf[RX_BUF_SIZE];
 uint8_t rxLen = 0;
@@ -108,17 +104,24 @@ void setup() {
   digitalWrite(PIN_ENA, LOW);   // enable driver (active LOW)
   delay(50);
 
-  // Initialise limit state from actual pin so no spurious messages on startup
   limitA_hit = (digitalRead(PIN_SW_A) == SWITCH_TRIGGERED);
   limitB_hit = (digitalRead(PIN_SW_B) == SWITCH_TRIGGERED);
 
-  Serial.println("IN:motor v5 ready ms=" + String(MICROSTEP_DIVISOR) +
-                 " dmin=" + String(STEP_DELAY_MIN_US) +
-                 " dmax=" + String(STEP_DELAY_MAX_US) +
-                 " ss=" + String(scanSampleSteps));
+  // Startup banner — String concatenation OK here (runs once)
+  Serial.print("IN:motor ready ms=");
+  Serial.print(MICROSTEP_DIVISOR);
+  Serial.print(" dmin=");
+  Serial.print(STEP_DELAY_MIN_US);
+  Serial.print(" dmax=");
+  Serial.print(STEP_DELAY_MAX_US);
+  Serial.print(" ss=");
+  Serial.println(scanSampleSteps);
+
   if (limitA_hit) Serial.println("LA");
   if (limitB_hit) Serial.println("LB");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 void loop() {
   handleSerial();
@@ -138,21 +141,26 @@ void loop() {
 }
 
 // ── Step telemetry ────────────────────────────────────────────────────────────
+// HOT PATH — called every scanSampleSteps motor steps for the entire scan.
+// Must not allocate heap.  Use chained Serial.print() instead of String.
 void sendStepTelemetry() {
-  // ST:<seq>,<cumulative_steps>
-  // seq is the index PC uses to pair with sensor readings — no timestamps
-  Serial.println("ST:" + String(seqNum) + "," + String(scanSteps));
+  Serial.print("ST:");
+  Serial.print(seqNum);
+  Serial.print(',');
+  Serial.println(scanSteps);
   seqNum++;
 }
 
 // ── Serial receive ────────────────────────────────────────────────────────────
+// Accumulate chars into rxBuf; process on newline.
+// Operates on raw char arrays — no String heap allocation.
 void handleSerial() {
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       if (rxLen > 0) {
         rxBuf[rxLen] = '\0';
-        processCommand(String(rxBuf));
+        processCommand();
         rxLen = 0;
       }
     } else if (rxLen < RX_BUF_SIZE - 1) {
@@ -161,63 +169,106 @@ void handleSerial() {
   }
 }
 
+// ── Helpers: parse integer from rxBuf starting at offset ─────────────────────
+static long parseLong(uint8_t offset) {
+  long v = 0;
+  bool neg = false;
+  uint8_t i = offset;
+  if (rxBuf[i] == '-') { neg = true; i++; }
+  while (rxBuf[i] >= '0' && rxBuf[i] <= '9') {
+    v = v * 10 + (rxBuf[i] - '0');
+    i++;
+  }
+  return neg ? -v : v;
+}
+
+static bool bufEq(const char* s) {
+  // Case-sensitive exact match against rxBuf
+  uint8_t i = 0;
+  while (s[i] && rxBuf[i]) {
+    if (s[i] != rxBuf[i]) return false;
+    i++;
+  }
+  return s[i] == '\0' && rxBuf[i] == '\0';
+}
+
+static bool bufStartsWith(const char* s) {
+  uint8_t i = 0;
+  while (s[i]) {
+    if (rxBuf[i] != s[i]) return false;
+    i++;
+  }
+  return true;
+}
+
 // ── Command parser ────────────────────────────────────────────────────────────
-void processCommand(const String& cmd) {
-  if (cmd.startsWith("PING:")) {
-    Serial.println("PONG:" + cmd.substring(5) + "," + String(millis()));
+// No String objects — all comparisons on raw rxBuf char array.
+void processCommand() {
+
+  if (bufStartsWith("PING:")) {
+    // PONG:<echo>,<millis>
+    Serial.print("PONG:");
+    Serial.print(rxBuf + 5);   // echo the token after PING:
+    Serial.print(',');
+    Serial.println(millis());
     return;
   }
-  if (cmd.startsWith("V")) {
-    stepDelay = constrain(cmd.substring(1).toInt(),
-                          STEP_DELAY_MIN_US, STEP_DELAY_MAX_US);
-    Serial.println("SP:" + String(stepDelay)); return;
+
+  if (rxBuf[0] == 'V' && rxLen > 1) {
+    stepDelay = (int)constrain(parseLong(1), STEP_DELAY_MIN_US, STEP_DELAY_MAX_US);
+    Serial.print("SP:"); Serial.println(stepDelay);
+    return;
   }
-  if (cmd.startsWith("W")) {
-    scanDelay = constrain(cmd.substring(1).toInt(),
-                          STEP_DELAY_MIN_US, STEP_DELAY_MAX_US);
-    Serial.println("IN:scanDelay=" + String(scanDelay)); return;
+  if (rxBuf[0] == 'W' && rxLen > 1) {
+    scanDelay = (int)constrain(parseLong(1), STEP_DELAY_MIN_US, STEP_DELAY_MAX_US);
+    Serial.print("IN:scanDelay="); Serial.println(scanDelay);
+    return;
   }
-  if (cmd.startsWith("B")) {
-    // Set SCAN_SAMPLE_STEPS
-    int ss = constrain(cmd.substring(1).toInt(),
-                       SCAN_SAMPLE_STEPS_MIN, SCAN_SAMPLE_STEPS_MAX);
+  if (rxBuf[0] == 'B' && rxLen > 1) {
+    int ss = (int)constrain(parseLong(1), SCAN_SAMPLE_STEPS_MIN, SCAN_SAMPLE_STEPS_MAX);
     scanSampleSteps = ss;
-    Serial.println("SS_STEPS:" + String(scanSampleSteps)); return;
+    Serial.print("SS_STEPS:"); Serial.println(scanSampleSteps);
+    return;
   }
 
-  if (mode != MANUAL && cmd != "A") {
-    Serial.println("WN:scan active"); return;
+  // During a scan, only A (abort) is accepted
+  if (mode != MANUAL && !bufEq("A")) {
+    Serial.println("WN:scan active");
+    return;
   }
 
-  if      (cmd == "R") {
+  if      (bufEq("R")) {
     if (limitB_hit) { Serial.println("WN:right limit"); return; }
     dir = GOING_RIGHT; setDir(true); Serial.println("OK:R");
   }
-  else if (cmd == "L") {
+  else if (bufEq("L")) {
     if (limitA_hit) { Serial.println("WN:left limit"); return; }
     dir = GOING_LEFT; setDir(false); Serial.println("OK:L");
   }
-  else if (cmd == "S") { dir = STOPPED; Serial.println("OK:S"); }
-  else if (cmd == "+") {
+  else if (bufEq("S")) { dir = STOPPED; Serial.println("OK:S"); }
+  else if (bufEq("+")) {
     stepDelay = max(STEP_DELAY_MIN_US, stepDelay - STEP_DELTA);
-    Serial.println("SP:" + String(stepDelay));
+    Serial.print("SP:"); Serial.println(stepDelay);
   }
-  else if (cmd == "-") {
+  else if (bufEq("-")) {
     stepDelay = min(STEP_DELAY_MAX_US, stepDelay + STEP_DELTA);
-    Serial.println("SP:" + String(stepDelay));
+    Serial.print("SP:"); Serial.println(stepDelay);
   }
-  else if (cmd == "X") { startScan(); }
-  else if (cmd == "A") { abortScan(); }
-  else { Serial.println("WN:unknown " + cmd); }
+  else if (bufEq("X")) { startScan(); }
+  else if (bufEq("A")) { abortScan(); }
+  else {
+    Serial.print("WN:unknown ");
+    Serial.println(rxBuf);
+  }
 }
 
 // ── Scan control ──────────────────────────────────────────────────────────────
 void startScan() {
-  stepDelay = scanDelay;
-  mode      = SCAN_HOMING;
-  limitA_hit = false;
+  stepDelay     = scanDelay;
+  mode          = SCAN_HOMING;
+  limitA_hit    = false;
   debounceA_low = 0;
-  dir       = GOING_LEFT;
+  dir           = GOING_LEFT;
   setDir(false);
   Serial.println("IN:homing");
 }
@@ -236,18 +287,17 @@ void beginMeasuring() {
   mode      = SCAN_MEASURING;
   dir       = GOING_RIGHT;
   setDir(true);
-  // delay(50);
   Serial.println("SS");
 }
 
 void finishScan() {
-  long total = seqNum;   // total ST packets sent
+  long total = seqNum;
   dir        = STOPPED;
   mode       = MANUAL;
   stepDelay  = STEP_DELAY_DEFAULT;
-  // Reset debounce so right limit clears cleanly after scan
   debounceB_low = 0;
-  Serial.println("SD:" + String(total));
+  Serial.print("SD:");
+  Serial.println(total);
 }
 
 // ── Limit switches — debounced ────────────────────────────────────────────────
@@ -275,7 +325,7 @@ void checkLimits() {
       if (mode == MANUAL) Serial.println("CA");
     }
   } else if (a) {
-    debounceA_low = 0;   // reset counter if pin bounces back HIGH
+    debounceA_low = 0;
   }
 
   // ── Right limit (SW_B) ────────────────────────────────────────────────────
@@ -289,11 +339,6 @@ void checkLimits() {
       Serial.println("LB");
     }
   }
-  // FIX: only clear limitB and send CB when gantry has genuinely moved away.
-  // Require DEBOUNCE_COUNT consecutive LOW readings before clearing.
-  // This prevents the infinite CB spam caused by the switch bouncing
-  // immediately after finishScan() sets mode=MANUAL while gantry is still
-  // physically pressing the switch.
   if (!b && limitB_hit) {
     debounceB_low++;
     if (debounceB_low >= DEBOUNCE_COUNT) {
@@ -302,7 +347,7 @@ void checkLimits() {
       if (mode == MANUAL) Serial.println("CB");
     }
   } else if (b) {
-    debounceB_low = 0;   // pin bounced back HIGH — reset counter
+    debounceB_low = 0;
   }
 }
 

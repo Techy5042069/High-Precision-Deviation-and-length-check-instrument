@@ -324,8 +324,22 @@ class GantryMaster:
           WN:<msg>             warning
           IN:<msg>             info / banner
         """
+        # SD: must be processed even after an OOR abort — OOR commonly fires
+        # on the last few readings as the gantry leaves the surface, then the
+        # motor immediately hits the right limit and sends SD:.  Without this
+        # early-exit exemption, scan_done is never set and _run_scan hangs.
+        if line.startswith("SD:"):
+            try:
+                self.scan_total = int(line[3:])
+            except ValueError:
+                self.scan_total = 0
+            self.scan_active = False
+            self.scan_done   = True
+            return
+
         if self.scan_aborted:
             return   # ignore any trailing messages after abort
+
         if line.startswith("ST:"):
             parts = line[3:].split(",")
             if len(parts) == 2 and self.scan_active:
@@ -344,15 +358,6 @@ class GantryMaster:
             self.sensor_map  = {}
             self.scan_active = True
             print("\n  [SCAN] Measuring...\n")
-
-        elif line.startswith("SD:"):
-            # Scan complete — motor reached the right limit switch
-            try:
-                self.scan_total = int(line[3:])
-            except ValueError:
-                self.scan_total = 0
-            self.scan_active = False
-            self.scan_done   = True
 
         elif line == "SA":
             # Abort acknowledged by motor
@@ -491,6 +496,86 @@ class GantryMaster:
         total = len(self.scan_data)
         print(f"  Matched: {total} points  "
               f"({total - missing} with sensor data, {missing} missing)")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # OOR window trim
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _trim_to_oor_window(self):
+        """
+        When OOR is enabled, discard data outside the surface window and
+        re-zero gantry position to the arm point.
+
+        Algorithm (mirrors sensor arming logic, done in Python on full data):
+
+          PHASE 1 — find arm index:
+            Walk scan_data from the start.  Count consecutive points whose
+            offset (dist − SENSOR_CENTER_MM) is within [oor_min_mm, oor_max_mm].
+            When the count reaches oor_arm_count, the arm index is the current
+            position.  An out-of-range reading resets the counter (we're still
+            in the pre-surface region).
+
+          PHASE 2 — find disarm index:
+            From the arm index, walk forward.  The first point that is out of
+            range (or has no dist) is the disarm index.  Everything from arm
+            to disarm−1 is kept.
+
+          RE-ZERO:
+            Subtract the step count at the arm index from every kept point so
+            position 0 mm corresponds to where the surface first entered range.
+
+        If OOR is disabled, or no arm point is found, scan_data is unchanged.
+        """
+        if not self.use_oor or not self.scan_data:
+            return
+
+        oor_min_mm = adc_to_delta_dist(self.oor_lo)
+        oor_max_mm = adc_to_delta_dist(self.oor_hi)
+
+        def in_range(dist):
+            if dist is None:
+                return False
+            offset = dist - SENSOR_CENTER_MM
+            return oor_min_mm <= offset <= oor_max_mm
+
+        # ── Phase 1: find arm index ───────────────────────────────────────────
+        arm_index = None
+        consec    = 0
+
+        for i, (_, _, _, dist) in enumerate(self.scan_data):
+            if in_range(dist):
+                consec += 1
+                if consec >= self.oor_arm_count:
+                    # Go back to where the consecutive run started
+                    arm_index = i - self.oor_arm_count + 1
+                    break
+            else:
+                consec = 0
+
+        if arm_index is None:
+            print("  [Trim] OOR enabled but surface never entered range — keeping all data.")
+            return
+
+        # ── Phase 2: find disarm index ────────────────────────────────────────
+        disarm_index = len(self.scan_data)   # default: keep to end
+
+        for i in range(arm_index + 1, len(self.scan_data)):
+            if not in_range(self.scan_data[i][3]):
+                disarm_index = i
+                break
+
+        # ── Trim and re-zero ──────────────────────────────────────────────────
+        window       = self.scan_data[arm_index:disarm_index]
+        origin_steps = window[0][1]
+
+        self.scan_data = [
+            (seq, steps - origin_steps, v, dist)
+            for seq, steps, v, dist in window
+        ]
+
+        print(f"  [Trim] Surface window: {len(self.scan_data)} pts  "
+              f"arm={origin_steps / self._spmm:.2f} mm  "
+              f"end={(self.scan_data[-1][1]) / self._spmm:.2f} mm")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Main menu
@@ -813,10 +898,14 @@ class GantryMaster:
         self.sensor.send("STOP")
 
         # ── Aborted path ──────────────────────────────────────────────────────
-        if self.scan_aborted:
+        # scan_done takes priority: OOR commonly fires on the last reading as
+        # the gantry leaves the surface, then SD: arrives milliseconds later.
+        # That is a complete scan — don't treat it as a partial abort.
+        if self.scan_aborted and not self.scan_done:
             print(f"\n  Motor STs received : {len(self.motor_map)}")
             print(f"  Sensor readings    : {len(self.sensor_map)}")
             self._match()
+            self._trim_to_oor_window()
             ans = input("\n  Save partial aborted scan? [Y/n]: ").strip().lower()
             if ans != "n":
                 self._show_plot()
@@ -851,6 +940,7 @@ class GantryMaster:
             return
 
         self._match()
+        self._trim_to_oor_window()
         self._show_plot()
         self._save_csv()
         input("\n  Press Enter to return to menu.")
