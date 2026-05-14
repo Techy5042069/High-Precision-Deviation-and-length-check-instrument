@@ -11,7 +11,7 @@
 //   - Sensor-side OOR detection
 //
 // PC → Arduino:
-//   START:en,lo,hi,ignoreTicks
+//   START:en,lo,hi,armCount
 //   STOP
 //   TICK
 //   DUMP
@@ -26,9 +26,10 @@
 //   PONG:<pc_ms>,<ard_ms>
 //
 // OOR:
-//   After ignoreTicks samples,
-//   if adc < lo OR adc > hi:
-//       OOR:<seq>,<adc>
+//   Sensor accumulates consecutive in-range readings.
+//   Once armCount consecutive readings land in [lo, hi],
+//   OOR detection is armed.  The first subsequent reading
+//   outside [lo, hi] sends OOR:<seq>,<adc> once.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -61,15 +62,21 @@ uint8_t bulkPending = 0;
 uint16_t bulkStartSeq = 0;
 
 // ── OOR ─────────────────────────────────────────────────────────────────────
+// Arming strategy: data-driven consecutive-reading gate.
+//
+//   oorArmCount   — number of consecutive in-range readings required to arm
+//   oorConsecIn   — running count of consecutive in-range readings seen so far
+//   oorArmed      — true once the gate has been satisfied
+//   oorFired      — true after the first OOR event (suppresses duplicates;
+//                   the PC aborts the scan on the first OOR anyway)
 
-bool oorEnabled = false;
-
-uint16_t oorLo = 0;
-uint16_t oorHi = 1023;
-
-uint16_t oorIgnoreTicks = 0;
-
-bool oorFired = false;
+bool     oorEnabled  = false;
+uint16_t oorLo       = 0;
+uint16_t oorHi       = 1023;
+uint16_t oorArmCount = 5;
+uint16_t oorConsecIn = 0;
+bool     oorArmed    = false;
+bool     oorFired    = false;
 
 // ── Scan state ──────────────────────────────────────────────────────────────
 
@@ -190,25 +197,46 @@ void takeSample(bool store = true)
   }
 
   // ── OOR detection ───────────────────────────────────────────────────────
+  // Phase 1 (not yet armed): count consecutive in-range readings.
+  //   Each in-range reading increments oorConsecIn.
+  //   An out-of-range reading resets the counter — the surface hasn't
+  //   appeared yet, so we're still in the pre-object region.
+  //   Once oorConsecIn reaches oorArmCount the detector is armed.
+  //
+  // Phase 2 (armed): any out-of-range reading fires OOR once and stops.
 
-  if (
-      oorEnabled &&
-      !oorFired &&
-      seq >= oorIgnoreTicks
-  )
+  if (oorEnabled && !oorFired)
   {
-    if (adc < oorLo || adc > oorHi)
+    bool inRange = (adc >= oorLo && adc <= oorHi);
+
+    if (!oorArmed)
     {
-      oorFired = true;
-      // tmp_seq = seq;
-      // tmp_adc = adc;
-      for(int i = 0; i<1; i++){
-              sendMsg(
-        "OOR:" +
-        String(seq) +
-        "," +
-        String(adc)
-      );
+      if (inRange)
+      {
+        oorConsecIn++;
+        if (oorConsecIn >= oorArmCount)
+        {
+          oorArmed = true;
+          sendMsg("IN:OOR armed at seq=" + String(seq));
+        }
+      }
+      else
+      {
+        oorConsecIn = 0;   // reset — not on the surface yet
+      }
+    }
+    else
+    {
+      // Armed: flag any out-of-range reading immediately
+      if (!inRange)
+      {
+        oorFired = true;
+        sendMsg(
+          "OOR:" +
+          String(seq) +
+          "," +
+          String(adc)
+        );
       }
     }
   }
@@ -354,16 +382,15 @@ void processCommand(const String &cmd)
 
     // Reset OOR state
 
-    oorEnabled = false;
+    oorEnabled  = false;
+    oorLo       = 0;
+    oorHi       = 1023;
+    oorArmCount = 5;
+    oorConsecIn = 0;
+    oorArmed    = false;
+    oorFired    = false;
 
-    oorLo = 0;
-    oorHi = 1023;
-
-    oorIgnoreTicks = 0;
-
-    oorFired = false;
-
-    // Parse START args
+    // Parse START:en,lo,hi,armCount
 
     int p1 = cmd.indexOf(':');
 
@@ -394,9 +421,9 @@ void processCommand(const String &cmd)
             1023
           );
 
-        oorIgnoreTicks =
-          max(
-            0,
+        oorArmCount =
+          (uint16_t)max(
+            1,
             rest.substring(c3 + 1).toInt()
           );
       }
@@ -407,7 +434,7 @@ void processCommand(const String &cmd)
       "oor=" + String(oorEnabled ? 1 : 0) +
       " lo=" + String(oorLo) +
       " hi=" + String(oorHi) +
-      " ignore=" + String(oorIgnoreTicks)
+      " arm=" + String(oorArmCount)
     );
   }
 

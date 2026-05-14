@@ -1,12 +1,12 @@
 {
   "pulley_teeth": 80,
   "microstep": 8,
-  "manual_rpm": 45.0,
-  "scan_rpm": 45.0,
+  "manual_rpm": 60.0,
+  "scan_rpm": 60.0,
   "scan_sample_steps": 10,
-  "bulk_size": 100,
-  "startup_ignore_steps": 150,
+  "bulk_size": 10,
   "use_oor": true,
-  "oor_lo": 102.3,
-  "oor_hi": 920.6999999999999
+  "oor_lo": 204.6,
+  "oor_hi": 818.3999999999997,
+  "oor_arm_count": 5
 }

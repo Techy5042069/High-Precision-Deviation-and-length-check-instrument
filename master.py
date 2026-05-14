@@ -38,7 +38,7 @@ from config import (
     DEFAULT_PULLEY_TEETH, DEFAULT_MICROSTEP, DEFAULT_FULL_STEPS,
     DEFAULT_PITCH_MM, DEFAULT_MANUAL_RPM, DEFAULT_SCAN_RPM,
     DEFAULT_SCAN_SAMPLE_STEPS, DEFAULT_BULK_SIZE,
-    DEFAULT_STARTUP_IGNORE_STEPS, CONFIG_FILE,
+    DEFAULT_OOR_ARM_COUNT, CONFIG_FILE,
 )
 from physics import (
     adc_to_dist, calc_spr, calc_spmm,
@@ -141,7 +141,6 @@ class GantryMaster:
         self.scan_rpm             = DEFAULT_SCAN_RPM
         self.scan_sample_steps    = DEFAULT_SCAN_SAMPLE_STEPS
         self.bulk_size            = DEFAULT_BULK_SIZE
-        self.startup_ignore_steps = DEFAULT_STARTUP_IGNORE_STEPS
 
         # ── Live sensor display (updated by _parse_sensor during any scan) ────
         self.last_volt = None   # most recent sensor voltage in V (float | None)
@@ -165,22 +164,15 @@ class GantryMaster:
         # Assembled output (populated by _match() after the scan):
         self.scan_data = []        # list of (seq, steps, voltage|None, dist|None)
 
-        # Measurement window tracking:
-        # We ignore the first `startup_ignore_steps` steps after homing because
-        # the motor is still in its acceleration ramp and the belt tension is
-        # not yet stable.  Once steps ≥ startup_ignore_steps, we set
-        # measurement_started = True and record the origin so positions
-        # reported in the CSV are relative to the measurement start, not homing.
-        self.measurement_started      = False
-        self.measurement_origin_steps = 0
 
         # ── Manual mode state ─────────────────────────────────────────────────
         self.manual_active = False  # True while the manual jog loop is running
         self.active_key    = None   # 'R', 'L', or None
 
-        self.use_oor = False
-        self.oor_lo  = 0
-        self.oor_hi  = 1023
+        self.use_oor      = False
+        self.oor_lo       = 0
+        self.oor_hi       = 1023
+        self.oor_arm_count = DEFAULT_OOR_ARM_COUNT  # consecutive in-range readings to arm OOR
 
         # Load saved config — overwrites all defaults above if the file exists
         self._load_config()
@@ -198,10 +190,10 @@ class GantryMaster:
             "scan_rpm":             self.scan_rpm,
             "scan_sample_steps":    self.scan_sample_steps,
             "bulk_size":            self.bulk_size,
-            "startup_ignore_steps": self.startup_ignore_steps,
             "use_oor":             self.use_oor,
             "oor_lo":              self.oor_lo,
             "oor_hi":              self.oor_hi,
+            "oor_arm_count":       self.oor_arm_count,
         }
 
     def _load_config(self):
@@ -224,10 +216,10 @@ class GantryMaster:
             self.scan_rpm             = d.get("scan_rpm",             self.scan_rpm)
             self.scan_sample_steps    = d.get("scan_sample_steps",    self.scan_sample_steps)
             self.bulk_size            = d.get("bulk_size",            self.bulk_size)
-            self.startup_ignore_steps = d.get("startup_ignore_steps", self.startup_ignore_steps)
             self.use_oor             = d.get("use_oor", self.use_oor)
             self.oor_lo              = d.get("oor_lo", self.oor_lo)
             self.oor_hi              = d.get("oor_hi", self.oor_hi)
+            self.oor_arm_count       = d.get("oor_arm_count", self.oor_arm_count)
             print(f"  [Config] Loaded from '{CONFIG_FILE}'.")
         except Exception as e:
             print(f"  [Config] Load error: {e} — using defaults.")
@@ -334,70 +326,14 @@ class GantryMaster:
         """
         if self.scan_aborted:
             return   # ignore any trailing messages after abort
-
-        # if line.startswith("ST:"):
-        #     # ── Step telemetry ────────────────────────────────────────────────
-        #     # Format: ST:<seq>,<cumulative_steps_since_scan_start>
-        #     # seq is shared with the sensor — sensor reading at seq N is
-        #     # matched to the motor position at seq N after the scan.
-        #     parts = line[3:].split(",")
-        #     if len(parts) == 2 and self.scan_active:
-        #         try:
-        #             seq   = int(parts[0])
-        #             steps = int(parts[1])
-
-        #             # ── Startup-ignore window ─────────────────────────────────
-        #             # Motor accelerates from standstill when the scan pass begins.
-        #             # We discard the first startup_ignore_steps steps to skip the
-        #             # ramp and only record data from the constant-velocity portion.
-        #             if not self.measurement_started:
-        #                 if abs(steps) >= self.startup_ignore_steps:
-        #                     self.measurement_started      = True
-        #                     self.measurement_origin_steps = steps
-        #                     print(
-        #                         f"\n  Measurement begins at "
-        #                         f"{steps} steps "
-        #                         f"({steps / self._spmm:.2f} mm from home)\n"
-        #                     )
-
-        #             if self.measurement_started:
-        #                 # Adjust so position 0 = start of measurement window
-        #                 adjusted = steps - self.measurement_origin_steps
-        #                 self.motor_map[seq] = adjusted
-        #                 # Tell the sensor to take one ADC reading right now.
-        #                 # The sensor assigns the same seq to its reading.
-        #                 self.sensor.send("TICK")
-
-        #         except ValueError:
-        #             pass   # malformed ST line — ignore
         if line.startswith("ST:"):
             parts = line[3:].split(",")
             if len(parts) == 2 and self.scan_active:
                 try:
                     seq   = int(parts[0])
                     steps = int(parts[1])
-
-                    # ── start measurement window ───────────────────────────────
-                    if not self.measurement_started:
-                        if abs(steps) >= self.startup_ignore_steps:
-                            self.measurement_started = True
-                            self.measurement_origin_steps = steps
-                            print(
-                                f"\n  Measurement begins at "
-                                f"{steps} steps "
-                                f"({steps / self._spmm:.2f} mm)\n"
-                            )
-
-                    if self.measurement_started:
-                        adjusted = steps - self.measurement_origin_steps
-                        self.motor_map[seq] = adjusted
-
-                        # ── FIX: throttle sensor triggering ─────────────────────
-                        # prevents overload at high resolution (1 step/mm)
-                        # keeps timing stable and avoids TCP backlog desync
-
-                        self.sensor.send("TICK")
-                        # if seq % 3 == 0:   # <-- KEY FIX (adjustable: 2–5 safe range)
+                    self.motor_map[seq] = steps
+                    self.sensor.send("TICK")
 
                 except ValueError:
                     pass
@@ -471,12 +407,8 @@ class GantryMaster:
                     for i, adc_s in enumerate(parts[1:]):
                         adc = int(adc_s)
                         seq = seq_start + i
-                        # Only store readings that fall inside the measurement window.
-                        # Readings received before measurement_started are from the
-                        # acceleration-ramp region and are discarded.
-                        if self.measurement_started:
-                            self.sensor_map[seq] = adc
-                        # Always update the live display values for manual mode 'I' key
+                        self.sensor_map[seq] = adc
+                        # Update live display for manual mode 'I' key
                         v, dist, alarm = adc_to_dist(adc)
                         self.last_volt = v
                         self.last_dist = None if alarm else dist
@@ -591,8 +523,6 @@ class GantryMaster:
             print(f"║  Scan   RPM : {self.scan_rpm:<6.1f}  ({s_actual:.1f} actual)             ║")
             print(f"║  Scan sample steps : {self.scan_sample_steps:<5}  "
                   f"Bulk size : {self.bulk_size:<5}           ║")
-            print(f"║  Startup ignore : {self.startup_ignore_steps:<5} steps"
-                  f"                         ║")
             print("╠══════════════════════════════════════════════════════╣")
             print("║  1.  Manual mode                                     ║")
             print("║  2.  Full Scan                                       ║")
@@ -647,14 +577,11 @@ class GantryMaster:
         self.bulk_size = prompt_int(
             "Sensor bulk packet size", self.bulk_size, 1, 100)
 
-        print("\n  ── Startup ignore (skip motor acceleration ramp) ──")
-        print("  Readings during the acceleration phase are noisy.")
-        print("  Increase this if the first few mm of scan look wrong.")
-        self.startup_ignore_steps = prompt_int(
-            "Ignore first N motor steps after homing",
-            self.startup_ignore_steps, 0, 100_000)
-
         print("\n  ── OOR Detection ─────────────────────────────")
+        print("  Sensor arms OOR detection after seeing N consecutive")
+        print("  in-range readings.  While not yet armed, out-of-range")
+        print("  readings simply reset the counter (pre-object region).")
+        print("  Once armed, the first out-of-range reading stops the scan.")
 
         use = input(
             f"  Enable OOR detection? "
@@ -675,6 +602,11 @@ class GantryMaster:
             adc_to_delta_dist(self.oor_hi),
             0, 5
         ))
+
+        self.oor_arm_count = prompt_int(
+            "Consecutive in-range readings to arm OOR",
+            self.oor_arm_count, 1, 1000
+        )
 
         # Push to hardware and persist
         self._push_config()
@@ -827,7 +759,6 @@ class GantryMaster:
         print(f"  Scan RPM       : {self.scan_rpm:.1f}")
         print(f"  Sample steps   : {self.scan_sample_steps}  ({self._res_mm:.2f}mm resolution)")
         print(f"  Bulk size      : {self.bulk_size}")
-        print(f"  Startup ignore : {self.startup_ignore_steps} steps\n")
 
         if input("  Start scan? [y/N]: ").strip().lower() != "y":
             print("  Cancelled.")
@@ -841,21 +772,17 @@ class GantryMaster:
         self.scan_done                = False
         self.scan_aborted             = False
         self.scan_total               = 0
-        self.measurement_started      = False
-        self.measurement_origin_steps = 0
 
         # ── Start scan ────────────────────────────────────────────────────────
-        ignore_ticks = (
-            self.startup_ignore_steps
-            + self.scan_sample_steps - 1
-        ) // self.scan_sample_steps
-
+        # Send OOR arm count directly — sensor arms OOR after it has seen
+        # oor_arm_count consecutive in-range readings, so arming is always
+        # data-driven and never depends on a step-count estimate.
         start_cmd = (
             f"START:"
             f"{1 if self.use_oor else 0},"
             f"{self.oor_lo},"
             f"{self.oor_hi},"
-            f"{ignore_ticks}"
+            f"{self.oor_arm_count}"
         )
 
         self.sensor.send(start_cmd)    # sensor resets buffer, seq counter

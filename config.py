@@ -48,8 +48,9 @@ DEFAULT_SCAN_RPM           = 30.0    # traverse speed during a scan pass
 DEFAULT_SCAN_SAMPLE_STEPS  = 10      # motor steps between sensor TICK requests
                                      #   resolution (mm) = sample_steps / steps_per_mm
 DEFAULT_BULK_SIZE          = 10      # ADC readings per TCP bulk packet (BK:)
-DEFAULT_STARTUP_IGNORE_STEPS = 0  # skip first N steps after homing
-                                     #   covers motor acceleration ramp
+DEFAULT_OOR_ARM_COUNT      = 5       # consecutive in-range ADC readings the
+                                     #   sensor must see before OOR detection
+                                     #   is armed.  Data-driven: no step math.
 
 # ── Config persistence ────────────────────────────────────────────────────────
 
