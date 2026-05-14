@@ -154,12 +154,16 @@ class TCPNode:
         """
         Send *msg* + '\\n' over TCP.
         Thread-safe: can be called from any thread.
+        Silently drops the message if the connection is no longer alive.
         """
+        if not self.connected:
+            return
         with self._lock:
             try:
                 self.sock.sendall((msg + "\n").encode())
             except Exception as e:
                 print(f"  [{self.name}] send error: {e}")
+                self.connected = False
 
     def _recv_loop(self):
         """
@@ -180,6 +184,7 @@ class TCPNode:
         except Exception:
             pass
         self.connected = False
+        self.lines.put("__DISCONNECTED__")   # wake any poll() waiter so the main thread notices
 
     def poll(self, timeout: float = 0.0):
         """

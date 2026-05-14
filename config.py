@@ -15,7 +15,7 @@ from version import VERSION  # noqa: F401  (re-exported for convenience)
 
 # ── Communication ─────────────────────────────────────────────────────────────
 
-MOTOR_BAUD  = 115200   # USB-serial baud rate for the motor Arduino
+MOTOR_BAUD  = 921600    # USB-serial baud rate for the motor Arduino 115200
 SENSOR_PORT = 5001     # TCP port the sensor Arduino listens on
 
 # ── ADC / Sensor physics ──────────────────────────────────────────────────────

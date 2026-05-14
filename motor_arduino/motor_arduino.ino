@@ -98,7 +98,7 @@ uint8_t rxLen = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(921600);
 
   pinMode(PIN_STEP, OUTPUT);
   pinMode(PIN_DIR,  OUTPUT);
@@ -236,7 +236,7 @@ void beginMeasuring() {
   mode      = SCAN_MEASURING;
   dir       = GOING_RIGHT;
   setDir(true);
-  delay(50);
+  // delay(50);
   Serial.println("SS");
 }
 
