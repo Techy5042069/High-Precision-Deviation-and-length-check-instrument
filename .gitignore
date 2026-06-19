@@ -1,4 +1,5 @@
 *.csv
 .editorconfig
+*.png
 
 __pycache__

@@ -951,13 +951,18 @@ class GantryMaster:
 
     def _show_plot(self):
         """
-        Display a two-panel matplotlib figure:
+        Display a single-panel matplotlib figure:
 
-          Top panel    — sensor distance (mm) vs gantry position (mm)
-          Bottom panel — raw sensor voltage (V) vs gantry position (mm)
+          Deviation from center (mm) vs gantry position (mm)
 
-        Both panels share the same X axis (gantry position).
+        Y axis is the sensor offset from SENSOR_CENTER_MM, fixed to
+        [-SENSOR_RANGE_MM, +SENSOR_RANGE_MM] (i.e. -5..+5mm) rather than the
+        raw 25-35mm distance band.  X axis is gantry position in mm — when
+        OOR trimming ran, position 0 is the OOR arm point (see
+        _trim_to_oor_window); otherwise it's the start of the scan pass.
         NaN is used for missing/alarm points so matplotlib gaps them cleanly.
+        When OOR detection is enabled, the configured OOR window is drawn
+        as a shaded green band with dashed borders.
 
         Requires: pip install matplotlib
         """
@@ -971,35 +976,37 @@ class GantryMaster:
         # Build X and Y arrays from scan_data
         steps_list = [d[1] for d in self.scan_data]
         pos_list   = [s / self._spmm for s in steps_list]   # convert to mm
-        dists      = [d[3] if d[3] is not None else float("nan") for d in self.scan_data]
-        volts      = [d[2] if d[2] is not None else float("nan") for d in self.scan_data]
+        deviations = [
+            (d[3] - SENSOR_CENTER_MM) if d[3] is not None else float("nan")
+            for d in self.scan_data
+        ]
 
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+        fig, ax = plt.subplots(figsize=(13, 6))
         fig.suptitle(
             f"Full Scan v{VERSION} — {len(self.scan_data)} points  "
             f"res={self._res_mm:.2f}mm  {self.scan_rpm:.0f}RPM",
             fontsize=12,
         )
 
-        # ── Distance panel ────────────────────────────────────────────────────
-        ax1.plot(pos_list, dists, color="#185FA5", lw=0.8, label="distance")
-        ax1.axhline(SENSOR_CENTER_MM, color="#888780", lw=0.8, ls="--",
-                    label=f"center {SENSOR_CENTER_MM}mm")
-        ax1.set_ylabel("Sensor distance (mm)")
-        ax1.set_ylim(SENSOR_CENTER_MM - SENSOR_RANGE_MM - 1,
-                     SENSOR_CENTER_MM + SENSOR_RANGE_MM + 1)
-        ax1.grid(True, alpha=0.3)
-        ax1.legend(fontsize=9)
+        # ── OOR window (drawn first so the trace renders on top) ───────────────
+        if self.use_oor:
+            oor_lo_mm = adc_to_delta_dist(self.oor_lo)
+            oor_hi_mm = adc_to_delta_dist(self.oor_hi)
+            ax.axhspan(oor_lo_mm, oor_hi_mm, color="green", alpha=0.12,
+                       label=f"OOR window [{oor_lo_mm:.2f}, {oor_hi_mm:.2f}]mm")
+            ax.axhline(oor_lo_mm, color="green", lw=0.8, ls="--")
+            ax.axhline(oor_hi_mm, color="green", lw=0.8, ls="--")
 
-        # ── Voltage panel ─────────────────────────────────────────────────────
-        ax2.plot(pos_list, volts, color="#1D9E75", lw=0.8)
-        ax2.axhline(5.0, color="#993C1D", lw=0.6, ls="--",
-                    label="5.0V = ADC saturated (sensor > 5V)")
-        ax2.set_ylabel("Voltage (V)")
-        ax2.set_xlabel("Gantry position (mm from measurement origin)")
-        ax2.set_ylim(0, 5.5)
-        ax2.legend(fontsize=8)
-        ax2.grid(True, alpha=0.3)
+        # ── Deviation trace ──────────────────────────────────────────────────
+        ax.plot(pos_list, deviations, color="#185FA5", lw=0.8, label="deviation")
+        ax.axhline(0.0, color="#888780", lw=0.8, ls="--", label="center (0mm)")
+
+        ax.set_ylabel("Deviation from center (mm)")
+        ax.set_xlabel("Gantry position (mm from measurement origin)")
+        ax.set_ylim(-SENSOR_RANGE_MM, SENSOR_RANGE_MM)
+        ax.set_xlim(left=0)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
 
         plt.tight_layout()
         plt.show(block=False)
