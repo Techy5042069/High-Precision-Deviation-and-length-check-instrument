@@ -1,0 +1,9 @@
+{
+  "bits": 10,
+  "range_mm": 10.0,
+  "nonlin_pct": 0.5,
+  "k": 3.0,
+  "input_dir": "./scans",
+  "output": "beam_uncertainty.csv",
+  "plot_output": "beam_plot.png"
+}
